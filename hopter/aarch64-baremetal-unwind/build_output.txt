@@ -1,0 +1,15 @@
+   Compiling aarch64-baremetal-unwind v0.1.0 (/home/cwyz/workspace/hopter/aarch64-baremetal-unwind)
+error: linking with `rust-lld` failed: exit status: 1
+  |
+  = note:  "rust-lld" "-flavor" "gnu" "--fix-cortex-a53-843419" "/home/cwyz/workspace/hopter/aarch64-baremetal-unwind/target/aarch64-unknown-none/debug/deps/rustcbYKsyo/symbols.o" "<33 object files omitted>" "--as-needed" "-Bstatic" "/home/cwyz/workspace/hopter/aarch64-baremetal-unwind/target/aarch64-unknown-none/debug/deps/{libunwinding-6cc25eab3d3383de,libgimli-d4a9a7a850b3a7cf,liballoc-8c76cd09366d706e,libcore-c8cc78f4e502150b,libcompiler_builtins-a020235ccfa63389}.rlib" "-L" "/home/cwyz/workspace/hopter/aarch64-baremetal-unwind/target/aarch64-unknown-none/debug/deps/rustcbYKsyo/raw-dylibs" "-Bdynamic" "--eh-frame-hdr" "-z" "noexecstack" "-o" "/home/cwyz/workspace/hopter/aarch64-baremetal-unwind/target/aarch64-unknown-none/debug/deps/aarch64_baremetal_unwind-3efde98b57778096" "--gc-sections" "-Tmemory.x"
+  = note: some arguments are omitted. use `--verbose` to show all linker arguments
+  = note: rust-lld: error: section '.text' will not fit in region 'RAM': overflowed by 20876 bytes
+          rust-lld: error: section '.eh_frame' will not fit in region 'RAM': overflowed by 53456 bytes
+          rust-lld: error: section '.eh_frame_hdr' will not fit in region 'RAM': overflowed by 62388 bytes
+          rust-lld: error: section '.gcc_except_table' will not fit in region 'RAM': overflowed by 77692 bytes
+          rust-lld: error: section '.rodata' will not fit in region 'RAM': overflowed by 104156 bytes
+          rust-lld: error: section '.data' will not fit in region 'RAM': overflowed by 104168 bytes
+          rust-lld: error: section '.bss' will not fit in region 'RAM': overflowed by 120592 bytes
+          
+
+error: could not compile `aarch64-baremetal-unwind` (bin "aarch64-baremetal-unwind") due to 1 previous error

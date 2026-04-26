@@ -1,0 +1,13 @@
+[package]
+name = "aarch64-baremetal-unwind"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+unwinding = { version = "0.2.8", default-features = false, features = ["unwinder", "fde-static", "personality", "panic"] }
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
