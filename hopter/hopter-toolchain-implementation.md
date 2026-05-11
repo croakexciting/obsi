@@ -890,6 +890,267 @@ LLVM 的 `FrameLowering::PrologEpilogInserter` 在机器码生成阶段已经完
 
 **结论**：过程宏可以作为原型验证工具（验证控制流结构是否正确），但在**正确性**上无法替代工具链改动。真正的分段栈需要在编译器最内层（机器码生成阶段、prologue 之前）插入检查，这只能通过修改 LLVM 实现。
 
+### 10.6 进一步追问：能不能改 ELF 来代替改编译器？
+
+既然过程宏改不了真正的 prologue，自然会想到**直接改最终产物**：在已经编译好的 ELF 里，找到每个函数符号入口，给它前面塞一段栈检查 prologue。
+
+这种思路属于 **静态二进制重写（static binary rewriting）**，工业上有真实工具（Dyninst、E9Patch、Egalito、Retrowrite 等），所以**不是"完全做不到"**。但它**仍然不能替代修改编译器**，原因不是单一的"做不到"，而是几个层次叠加起来的硬约束。
+
+#### 10.6.1 ELF 重写大致能做到的事
+
+如果只是机械地"插指令"，ELF 层确实有抓手：
+
+- `.symtab` / `.dynsym` 可以列出大部分函数符号入口；
+- `.text` 里的机器码可以反汇编，识别出 `sub rsp, N` 这一类帧分配指令；
+- `.eh_frame` / DWARF CFI 可以告诉你 callee-saved 寄存器、`CFA = rsp + N` 等部分 frame 信息；
+- 可重定位文件（`.o`）允许新增 section、改重定位、插 trampoline。
+
+也就是说，**"在每个函数入口前插一段 stub，跳过去做检查再跳回来"** 这件事，在 ELF 层是可以做的。
+
+#### 10.6.2 但有几个根本性的难点和过程宏类似——只是"位置"不同
+
+ELF 重写比过程宏强的地方在于：它至少能看到所有真实机器码符号、看到最终的 `sub rsp, N`。但它仍然有几个**与 LLVM 后端比起来无法弥补**的问题：
+
+##### 问题 A：真实 frame size 在 ELF 层只能"近似"
+
+LLVM 在 `FrameLowering::emitPrologue` 时知道：
+
+- 局部变量、临时对象、spill slot
+- callee-saved 保存区
+- 出参传递区（outgoing args）
+- ABI 对齐 padding
+- alloca / VLA / red zone 等动态部分
+- panic / unwind / drop glue 占用的影子空间
+
+而 ELF 重写**只能事后看 `sub rsp, N`**，这只是其中"已经合并完成的最终值"，无法区分这些组成部分；动态部分（alloca、运行期对齐）更是完全不可见。换句话说：
+
+> 编译器看到的是"为什么是 N"；ELF 重写看到的是"现在是 N"——后者足以做粗粒度检查，但做不到精确、可证明的 prologue。
+
+##### 问题 B：你不能在原入口"原地"插指令
+
+`.text` 是固定布局的字节流，在原入口前插指令意味着函数地址改变，而所有 `call foo`、函数指针、vtable、跳转表、`.eh_frame`/CFI、PLT/GOT 重定位 **都是按原地址索引的**。所以实际只能：
+
+- **方案 A**：把入口前几条指令改成 `jmp stub`，stub 检查后跳回——但原指令长度可能不够装下一条 5 字节 jmp（x86_64），ARM 上还要考虑跳转范围、对齐和 IT block；
+- **方案 B**：把整个函数搬到新 section，原地址放 trampoline，再修复所有 relocation 与 CFI——这就是 Dyninst / E9Patch 实际做的事，工程量极大。
+
+##### 问题 C：异常处理 / unwind / debug 信息会被同步打乱
+
+只要动了函数入口或中间位置，下面这些表必须跟着改：
+
+- `.eh_frame_hdr` / `.eh_frame` 里的 FDE
+- `.gcc_except_table`（landing pad、call site）
+- `.debug_info` / `.debug_line`
+- ARM 上的 `.ARM.exidx` / `.ARM.extab`
+
+任何一项不同步，后果直接对应 Hopter 关心的核心机制：
+
+- panic unwind 失败、析构函数被跳过；
+- backtrace / gdb 看到错误的栈；
+- 已经为分段栈调好的 unwinder 行为被破坏。
+
+##### 问题 D："每个函数符号"这个集合本身就不完整
+
+ELF 符号表里看到的函数 ≠ 真正会被执行的入口：
+
+- 被 inline 掉的函数没有独立符号；
+- LTO / ICF（identical code folding）会把多个函数合并成同一段代码；
+- drop glue、closure、async 状态机生成的函数可能没有友好符号；
+- thunk、PLT stub、outlined function 也是函数样的代码块，但容易被遗漏。
+
+也就是说：**"给每个函数符号都加 prologue"——这个集合本身就漏。**
+
+##### 问题 E：调用者并不一定走符号入口
+
+下面这些路径在运行时是真的会进入函数体的：
+
+- 函数指针、vtable
+- `setjmp/longjmp`
+- C++/Rust 异常 unwind 时的 landing pad
+- inline asm 跳到内部 label
+- tail call 直接跳到函数中部
+- coroutine / `async` resume
+
+ELF 符号入口看不到这些"逻辑入口"。只在符号入口加 prologue，**这些路径全部绕过了检查**——和过程宏的"入口覆盖不完整"问题是同一个，只是改在了产物层。
+
+#### 10.6.3 三种方案的能力对比
+
+| 能力 | 过程宏 | ELF 重写 | 改编译器 / LLVM |
+|---|---|---|---|
+| 知道真实 frame size | ❌ 仅源码级估算 | ⚠️ 仅能看 `sub rsp, N`，缺少组成 | ✅ 精确（spill/对齐/ABI 都知道） |
+| 在每个真实入口插 prologue | ❌ 仅显式标注的函数 | ⚠️ 大部分函数符号 | ✅ 所有带栈帧的函数 |
+| 处理 inline / LTO / ICF / outlined | ❌ | ❌（信息已丢失） | ✅ |
+| 与 unwind / DWARF / 异常表一致 | 不涉及 | ⚠️ 必须自己同步重建 | ✅ 自动一致 |
+| 处理 tail call / 函数中部入口 | ❌ | ❌ | ✅ |
+| 工程难度 | 低 | **极高（接近一个完整 binary rewriter）** | 中等（一次性集成进 toolchain） |
+| 与 Hopter 已有机制（unwind、SVC #255 ABI、`.ARM.exidx`）一致性 | ❌ | ⚠️ 需要重新维护 | ✅ 与 Patch 1/2/3 直接对齐 |
+
+#### 10.6.4 为什么对 Hopter 来说"还是改编译器"
+
+在通用场景下，ELF 重写有它合适的位置——尤其是当**没有源码、不能改 toolchain**时，它是少数可行手段。但 Hopter 的实际情况是：
+
+- 源码可控（`hopter/`、`hopter-compiler-toolchain/`）；
+- toolchain 已经在改，并且**不止 prologue**：还包含 drop handler 区分（Patch 2）、阻止 `nounwind` 优化（Patch 3）等关键改动；
+- 分段栈 prologue 必须与 unwind 行为、`__morestack` ABI、`.ARM.exidx` 严格协同——任何"事后重写"都要把这一整套约束重新维护一遍。
+
+也就是说：
+
+> **改编译器是"在源头一次性做对"；ELF 重写是"在产物上修补一切"。**
+> **后者覆盖度优于过程宏，但仍有真实 frame size、所有真实入口、unwind 一致性这一类信息只能近似处理；而且要把 Hopter 现有 Patch 1/2/3 的语义一起在 ELF 上重建，代价比直接改编译器更大。**
+
+所以本章给出的最终结论是：在 Hopter 这个具体语境下，**过程宏做不到**，**ELF 重写理论可行但更昂贵且更脆弱**，**修改编译器（LLVM + rustc）仍是唯一现实可靠的路径**。
+
+### 10.7 改进思路：让分段栈不再绑死定制 toolchain
+
+§10.5 / §10.6 的结论是"必须改编译器"，但这并不意味着**用户也必须自己重编 toolchain**。下面给出 5 条可能的改进路线，按"代价由低到高、普适性由窄到广"排列，每条说**做法**、**能解决什么**、**还剩什么坑**，作为 Hopter 后续可以演进的方向参考。
+
+#### 思路 1：把 LLVM 改动"瘦身 + 上游化"，从定制 toolchain 退化到 Cargo 配置
+
+最现实的一步，不是去掉编译器改动，而是**让用户感受不到它**。
+
+**做法**
+
+- 把 Patch 1 的 ARM split-stack 实现整理后**提交给 LLVM 上游**——LLVM 已经支持 x86 split-stack，ARM 一直缺，这不是凭空新功能；
+- 把 Rust 那 4 个 patch 中能上游的（如 `#[no_split_stack]` 在 ARM 启用、原子指令在 thumbv6m 启用）也走 RFC；
+- 剩下没上游的部分，做成 **rustc driver wrapper** 或 **`-Z` 实验 flag**，而不是必须重编 rustc。
+
+**结果**
+
+- 用户只需 `rustup component add` + `rust-toolchain.toml` 指定一个频道，**不再需要从源码 build toolchain**；
+- "改编译器"这件事仍然存在，但对使用者透明。
+
+**坑**
+
+- 上游周期长；LLVM 对新后端 split-stack 的合并门槛不低；
+- Patch 2 / Patch 3（drop handler 区分、阻止 nounwind）和 Hopter unwind 强耦合，难以单独上游。
+
+> 这条路**不是消除改动**，而是**消除用户侧的安装成本**。这是最务实的"普适化"。
+
+#### 思路 2：把分段栈做成 LLVM out-of-tree pass / 插件
+
+**做法**
+
+- 写一个 **out-of-tree LLVM pass**（`-fpass-plugin=` / `-Cllvm-args`），在 `FrameLowering` 之后插入 prologue；
+- 不改 LLVM 源码，发布成一个 `.so` / `.dylib`；
+- 通过 `rustc -C llvm-args=-load=hopter_segstack.so` 加载。
+
+**结果**
+
+- 用户只需安装一个插件，不需要重编 rustc/LLVM；
+- Pass 在**机器码生成阶段**运行，仍能拿到精确 frame size；
+- 跨项目可复用，类似 ASan / TSan 的部署模式。
+
+**坑**
+
+- LLVM 的 backend pass 插件接口比 IR pass 弱，机器函数 pass（`MachineFunctionPass`）能否被 out-of-tree 加载，**和 LLVM 版本紧耦合**；
+- 仍然需要锁定一个 LLVM 版本；
+- Rust 这边的 `#[no_split_stack]` 属性识别，仍要靠 IR 上的 metadata。
+
+> 比思路 1 更"轻"，但 LLVM 版本兼容性是硬约束。
+
+#### 思路 3：从"每函数检查"换成"任务级硬件保护"——彻底无 toolchain 改动
+
+放弃"每个函数都查一次"，改成：
+
+**做法**
+
+- 任务创建时只给一个**很小的初始 stacklet**（如 256B）；
+- 在 **MPU/MMU** 上把 stacklet 之外标为不可写；
+- 任何越界写发生 **MemManage Fault / Data Abort**；
+- fault handler 里：
+  - 决定要不要扩栈；
+  - 申请新 stacklet；
+  - 修改 saved SP，重做那条触发的 store；
+  - 异常返回继续执行。
+
+**结果**
+
+- **完全不改编译器**，标准 Rust + 标准 LLVM；
+- 普适性最好，任何 crate（包括二进制依赖）都自动受保护；
+- 检查由硬件做，零运行时 prologue 开销。
+
+**坑**
+
+- 重做触发指令需要在 fault handler 里**部分模拟一条指令**（Cortex-M 上可行但要小心 LDM/STM、unaligned）；
+- 栈"扩展"必须是**原地扩展**或借助映射技巧——这就是为什么大型 OS 用页表更省事，裸机 MPU 区域有限；
+- 对 STM32F4 这种 MPU 区域只有 8 个的设备，需要把 stacklet 链表压缩到很少的 region；
+- 大 frame 函数一次性写超出 stacklet 多页时，处理变复杂。
+
+> 这是"放弃精确 prologue、换硬件保护"的方案。普适性最好，但工程上要解决 fault handler 重放问题。Hopter 现有的 SVC 扩栈逻辑可以复用。
+
+#### 思路 4：post-link binary rewriting 做成构建脚本
+
+**做法**
+
+- 不改编译器，但在 `cargo build` 之后跑一个**链接后改写工具**：
+  - 解析 ELF；
+  - 用 DWARF/CFI + 反汇编恢复每个函数的 frame size；
+  - 把每个函数入口改写成 trampoline；
+  - 同步修 `.eh_frame` / `.ARM.exidx` / 重定位；
+- 用 LLVM 的 `MCDisassembler` + BOLT / Egalito，或者自研。
+
+**结果**
+
+- 用户只需在 `build.rs` 里加一行；
+- 任何 Rust 代码（包括预编译 crate）都能被处理。
+
+**坑**
+
+- §10.6 已经分析过：frame size 只能近似（看不到 alloca/对齐组成）、入口集合不完整（inline/LTO/ICF/tail call）、unwind 表必须一起重建；
+- 工程量接近"半个 BOLT"，**比改编译器更难**；
+- 在 Hopter 上还要兼容 SVC #255 ABI 和 `.ARM.exidx` 的约束。
+
+> 普适性看似好，但**正确性脆弱**，不建议作为主线，可以作为"实验对照组"。
+
+#### 思路 5：换栈模型——彻底绕开"必须改 prologue"这个前提
+
+如果"分段栈"只是手段、目标是**安全 + 节省内存**，那可以换实现。
+
+**5a. 保护页 + 按需 commit（虚拟内存平台）**
+
+- 用 MMU 给每个任务保留较大虚拟地址空间（如 64KB），但只 commit 一小块；
+- 栈底放 guard page，越界 → 缺页 → handler 决定 commit 更多页或杀任务；
+- Linux / QNX / Zephyr-MMU 上是标准做法；
+- **完全不需要 prologue**。
+
+**5b. Stackful coroutine + 池化栈 + 静态调用图分析**
+
+- 任务用协程，栈从池里按大小分级分配；
+- 分析阶段用 LLVM `-fstack-size` / `cargo-call-stack` 给每个函数标 frame，调用图算最大深度；
+- 创建时按算出的上界分配，**永不扩栈**；
+- 仍需"知道 frame size"，但不需要在运行时插 prologue——是**静态分析 + 一次性分配**。
+
+**5c. Async / state-machine 化**
+
+- Rust `async fn` 把"局部变量"变成结构体字段，不再放栈上；
+- 适合 IO 密集型任务；CPU 密集仍需要栈。
+
+**结果**
+
+- 三种都是"换问题"，避免"运行时检查 prologue"这个核心难点；
+- 5b 和 Hopter 现有"小栈 + 任务"哲学最对齐，且**只需要一个静态分析工具**，不需要改编译器。
+
+**坑**
+
+- 5a 依赖 MMU，Cortex-M 不行；
+- 5b 依赖准确的 call-graph，间接调用/函数指针/递归会破坏边界——但可以要求"不递归 + 函数指针白名单"；
+- 5c 对编程模型侵入大。
+
+#### 改进思路总览与优先级建议
+
+| 优先级 | 思路 | 是否改编译器 | 普适性 | 主要风险 |
+|---|---|---|---|---|
+| **首选** | 思路 1（上游化 + 配置化） | 仍改，但用户透明 | 高 | 上游合并周期长 |
+| **同时探索** | 思路 5b（静态分析 + 池化栈） | ❌ 不改 | 中（需限制递归/函数指针） | call-graph 准确性 |
+| **可做实验** | 思路 2（LLVM 插件） | 弱改 | 中 | LLVM 版本绑定 |
+| **平台决定** | 思路 3（MPU fault 扩栈） | ❌ 不改 | 仅 MPU/MMU 平台 | fault handler 重放 |
+| **不建议主线** | 思路 4（ELF 重写） | ❌ 不改 | 看似高，实际脆弱 | unwind / 入口完整性 |
+
+#### 一句话总结
+
+> **"必须改编译器"的前提是"必须在运行时精确检查每个函数 frame"。**
+> **要普适化，要么把改动透明化（思路 1 / 2），要么换一个不依赖运行时 prologue 的安全模型（思路 3 / 5）。**
+> **post-link 重写（思路 4）听起来普适，但实际比改编译器更脆弱。**
+
 ---
 
 ## 11. 编译器各 Patch 协作关系总览

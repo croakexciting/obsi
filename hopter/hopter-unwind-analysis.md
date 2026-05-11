@@ -575,3 +575,53 @@ sequenceDiagram
 - Hopter unwind 的核心难点不在于展开指令本身的解释执行，而在于**分段栈场景下如何通过 SVC 将执行流安全切换到正确的 landing pad**。
 - `aarch64-baremetal-unwind` 实证了：在 AArch64 bare-metal 上同类恢复语义完全可以落地，底层元数据格式的差异（`exidx/extab` vs `.eh_frame`）不影响语义目标的实现。
 - 面向 Linux kernel module 与 seL4 的工程实践，关键是抓住两个本质：**明确的恢复边界**和**可证明的分层清理**，而不是将完整的 ABI unwind 路径照搬到新环境中。
+
+---
+
+## 12. 讨论补充（FAQ）
+
+### 12.1 `start_unwind_entry` 是循环吗？
+
+不是。`start_unwind_entry` 是一次性入口，职责是：保存初始上下文、创建 `UnwindState`、调用一次 `resume_unwind`，再跳到本轮选出的 landing pad。
+
+真正的循环在 `resume_unwind` 内部：它反复调用 `unwind_next_function`，直到找到下一段可执行的 landing pad 为止。
+
+### 12.2 `bx r1` 最终跳到哪里？
+
+`bx r1` 跳到的是本轮 unwinder 根据当前 PC 和 LSDA 查出来的 `land_addr`，不是固定跳到某个命名函数。
+
+- 命中 cleanup landing pad：执行本帧 cleanup，末尾通常调用 `_Unwind_Resume` 继续展开。
+- 命中 catch 边界对应路径：进入 catch 处理，不再回到 `_Unwind_Resume` 链。
+
+### 12.3 `svc TaskUnwindLand` 之后还会执行下面的 `ldr sp` 和 `bx r1` 吗？
+
+通常不会（线程上下文路径）。
+
+原因是 `TaskUnwindLand` 在 SVC 中会改写任务 trap frame 的 `pc/sp`，SVC 退出时通过 exception return 直接回到 landing pad 执行，而不是回到 SVC 下一条普通指令。
+
+只有 ISR 分支会跳过该 SVC，这时才会执行后续本地的 `ldr sp` + `bx r1`。
+
+### 12.4 为什么看起来每次 `_Unwind_Resume` 都要走 SVC？
+
+因为 `_Unwind_Resume` 再次进入 unwinder 时，需要重新准备 unwinder 自己的执行栈（专用 stacklet），并在返回 landing 前由内核统一完成落地切换。
+
+注意：不是把 landing pad 放在 unwinder 栈上执行。landing pad 仍在目标任务栈帧上执行；新申请的栈是给 unwinder 运行 `resume_unwind/unwind_next_function` 这段逻辑使用。
+
+另外，ISR 上下文下会跳过 SVC 路径，不是无条件每次都发 SVC。
+
+### 12.5 这里说的 unwinder，具体指哪段执行流？
+
+在 Hopter 里，unwinder 指以下协作链路：
+
+1. `panic_handler -> start_unwind_entry`
+2. `create_unwind_state`
+3. `resume_unwind`（主循环）
+4. `unwind_next_function`（逐帧 `step` + LSDA 查表）
+5. `TaskUnwindLand`（把控制流落到 `land_addr`）
+6. cleanup 完成后 `_Unwind_Resume` 回到第 3 步
+
+### 12.6 不使用 `catch_unwind` 时，默认 landing pad 在做什么？
+
+默认 landing pad 主要做 cleanup（执行 `Drop`）。cleanup 结束后调用 `_Unwind_Resume` 继续向上展开。
+
+也就是说，默认行为是“清理并继续传播”，不是“吞掉 panic”。只有 catch 边界会终止继续上抛。
