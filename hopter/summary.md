@@ -11,6 +11,7 @@ Hopter 学习记录总结，汇总所有相关的文章和进度
 
 ## 学习笔记
 
+- [AArch64 no_std 内核 panic 恢复与栈保护系统设计（完整方案）](aarch64-panic-recovery-design.md)
 - [hopter 栈检查，异常处理，任务恢复功能实现](hopter-toolchain-implementation.md)
 - [hopter softlock 功能设计实现](hopter-softlock-analysis.md)
 - [softlock 使用固定下半部分，相关设计实现](soft-lock-fixed-functions.md)
